@@ -1,0 +1,13 @@
+model_name: distil-whisper-large-v3
+quantization_type: float32
+device_type: cuda
+task_mode: transcribe
+show_clipboard_window: false
+supported_quantizations:
+  cpu:
+  - float32
+  cuda:
+  - float16
+  - bfloat16
+  - float32
+curate_transcription: true
