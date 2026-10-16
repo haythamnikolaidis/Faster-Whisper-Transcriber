@@ -6,8 +6,14 @@ from PySide6.QtCore import QObject, Signal, QRunnable, QThreadPool
 
 from core.temp_file_manager import temp_file_manager
 from core.logging_config import get_logger
+from core.transcription.engine import transcribe_segments
 
 logger = get_logger(__name__)
+
+# faster-whisper's own default for ``temperature``. The service never passed one
+# before it went through the engine, so the model ran with this fallback list;
+# the engine's default is the single value 0.0, which would drop the fallback.
+_FASTER_WHISPER_TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
 
 class _TranscriberSignals(QObject):
@@ -43,27 +49,20 @@ class _TranscriptionRunnable(QRunnable):
 
             logger.info(f"Starting transcription: {self.audio_file}")
 
-            if self.batch_size is not None and int(self.batch_size) > 1:
-                from faster_whisper import BatchedInferencePipeline
-                batched_model = BatchedInferencePipeline(model=self.model)
-                segments, _ = batched_model.transcribe(
-                    str(self.audio_file),
-                    language=None,
-                    task=self.task_mode,
-                    batch_size=int(self.batch_size),
-                )
-            else:
-                segments, _ = self.model.transcribe(
-                    str(self.audio_file),
-                    language=None,
-                    task=self.task_mode,
-                )
+            batched = self.batch_size is not None and int(self.batch_size) > 1
+            transcript = transcribe_segments(
+                self.model,
+                self.audio_file,
+                task=self.task_mode,
+                batch_size=self.batch_size,
+                # Left unset before the engine, so faster-whisper's own default
+                # applied, and that default differs by path: the batched
+                # pipeline filters with VAD, the plain model does not.
+                vad_filter=batched,
+                temperature=_FASTER_WHISPER_TEMPERATURES,
+            )
 
-            text_parts = []
-            for segment in segments:
-                text_parts.append(segment.text)
-
-            text = "\n".join(text_parts)
+            text = "\n".join(segment.text for segment in transcript.segments)
             logger.info("Transcription completed successfully")
             self.signals.transcription_done.emit(text)
 
