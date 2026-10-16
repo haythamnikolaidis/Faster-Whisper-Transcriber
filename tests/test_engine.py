@@ -11,8 +11,11 @@ import pytest
 
 from core.transcription.engine import (
     Cancelled,
+    Segment,
+    SegmentedTranscript,
     Transcript,
     Word,
+    transcribe_segments,
     transcribe_with_words,
 )
 
@@ -268,6 +271,154 @@ def test_small_batch_size_calls_the_model_directly(fake_batched_pipeline, batch_
     assert fake_batched_pipeline == {}
     ((_, kwargs),) = model.calls
     assert "batch_size" not in kwargs
+
+
+def test_task_defaults_to_transcribe_and_is_not_sent_to_the_model():
+    model = FakeModel(two_segments())
+
+    transcribe_with_words(model, "a.wav")
+    transcribe_with_words(model, "a.wav", task="transcribe")
+
+    assert all("task" not in kwargs for _, kwargs in model.calls)
+    assert len(model.calls) == 2
+
+
+@pytest.mark.parametrize("function", [transcribe_with_words, transcribe_segments])
+def test_translate_task_reaches_the_model(function):
+    model = FakeModel(two_segments())
+
+    function(model, "a.wav", task="translate")
+
+    ((_, kwargs),) = model.calls
+    assert kwargs["task"] == "translate"
+    assert kwargs["word_timestamps"] is True
+
+
+def test_translate_task_reaches_the_batched_pipeline(fake_batched_pipeline):
+    transcribe_segments(FakeModel([]), "a.wav", task="translate", batch_size=4)
+
+    assert fake_batched_pipeline["kwargs"]["task"] == "translate"
+    assert fake_batched_pipeline["kwargs"]["batch_size"] == 4
+
+
+def test_transcribe_task_is_not_sent_to_the_batched_pipeline(fake_batched_pipeline):
+    transcribe_segments(FakeModel([]), "a.wav", batch_size=4)
+
+    assert "task" not in fake_batched_pipeline["kwargs"]
+
+
+def test_temperature_accepts_a_fallback_sequence():
+    fallback = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    model = FakeModel(two_segments())
+
+    transcribe_segments(model, "a.wav", temperature=fallback)
+
+    ((_, kwargs),) = model.calls
+    assert kwargs["temperature"] == fallback
+
+
+def test_segments_keep_text_timing_and_words():
+    model = FakeModel(two_segments(), duration=5.0, language="en")
+
+    transcript = transcribe_segments(model, "sermon.wav")
+
+    assert isinstance(transcript, SegmentedTranscript)
+    assert transcript.language == "en"
+    assert transcript.duration == 5.0
+    assert transcript.segments == [
+        Segment(
+            0.0,
+            2.5,
+            " In the beginning",
+            [
+                Word(0.0, 0.4, " In", 0.98),
+                Word(0.4, 0.7, " the", 0.91),
+                Word(0.7, 2.5, " beginning", 0.64),
+            ],
+        ),
+        Segment(
+            2.5,
+            5.0,
+            " God created",
+            [
+                Word(2.5, 3.1, " God", 0.88),
+                Word(3.1, 5.0, " created", 0.73),
+            ],
+        ),
+    ]
+
+
+@pytest.mark.parametrize("no_words", [None, []])
+def test_segment_without_words_keeps_its_text(no_words):
+    segments = [
+        FakeSegment(0.0, 1.0, " ...", no_words),
+        FakeSegment(1.0, 2.0, " Amen", [FakeWord(1.0, 2.0, " Amen", 0.9)]),
+    ]
+
+    transcript = transcribe_segments(FakeModel(segments, duration=2.0), "a.wav")
+
+    assert [(segment.text, len(segment.words)) for segment in transcript.segments] == [
+        (" ...", 0),
+        (" Amen", 1),
+    ]
+    assert "\n".join(segment.text for segment in transcript.segments) == " ...\n Amen"
+
+
+def test_segment_text_is_not_rebuilt_from_the_words():
+    segments = [
+        FakeSegment(0.0, 1.0, " Hello, world.", [FakeWord(0.0, 1.0, " Hello", 0.9)]),
+    ]
+
+    transcript = transcribe_segments(FakeModel(segments, duration=1.0), "a.wav")
+
+    assert transcript.segments[0].text == " Hello, world."
+
+
+def test_no_segments_gives_an_empty_segmented_transcript():
+    transcript = transcribe_segments(FakeModel([], duration=0.0), "silence.wav")
+
+    assert transcript == SegmentedTranscript(segments=[], language="en", duration=0.0)
+
+
+def test_segments_use_the_same_model_call_as_the_word_list():
+    for_words = FakeModel(two_segments())
+    for_segments = FakeModel(two_segments())
+
+    transcribe_with_words(for_words, "a.wav", initial_prompt="Genesis")
+    transcribe_segments(for_segments, "a.wav", initial_prompt="Genesis")
+
+    assert for_words.calls == for_segments.calls
+
+
+def test_the_word_list_is_the_flattened_segments():
+    flat = transcribe_with_words(FakeModel(two_segments(), duration=5.0), "a.wav")
+    grouped = transcribe_segments(FakeModel(two_segments(), duration=5.0), "a.wav")
+
+    assert flat.words == [
+        word for segment in grouped.segments for word in segment.words
+    ]
+    assert (flat.language, flat.duration) == (grouped.language, grouped.duration)
+
+
+def test_segment_progress_and_cancel_behave_like_the_word_list():
+    seen = []
+    transcribe_segments(
+        FakeModel(two_segments(), duration=10.0), "a.wav", progress=seen.append
+    )
+    assert seen == [0.25, 0.5]
+
+    model = FakeModel(two_segments() + two_segments())
+    seen = []
+    with pytest.raises(Cancelled):
+        transcribe_segments(
+            model, "a.wav", progress=seen.append, cancel=lambda: len(seen) >= 2
+        )
+    assert model.pulled == 2
+
+    untouched = FakeModel(two_segments())
+    with pytest.raises(Cancelled):
+        transcribe_segments(untouched, "a.wav", cancel=lambda: True)
+    assert untouched.calls == []
 
 
 def test_importing_the_engine_does_not_import_qt():
